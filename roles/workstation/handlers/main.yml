@@ -36,3 +36,13 @@
 
 - name: restart polkit
   service: name=polkit state=restarted
+
+- name: restart zram
+  ansible.builtin.systemd:
+    name: systemd-zram-setup@zram0.service
+    state: restarted
+    enabled: true
+
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
