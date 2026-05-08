@@ -1,60 +1,147 @@
-# get the current swap size and available disk space
-- name: get current swap size
-  ansible.builtin.shell:
-    cmd: swapon --show | grep /swapfile | awk '{print $3}' | sed 's/.$//'
-  register: swapSize
+- name: Get system RAM in GB
+  ansible.builtin.set_fact:
+    ram_gb: "{{ (ansible_memtotal_mb / 1024) | round(0, 'ceil') | int }}"
 
-- name: get system RAM in GB
-  set_fact:
-    ram: "{{ ansible_memtotal_mb // 1024 }}" # Convert to GB
+- name: Get free disk space on /
+  ansible.builtin.set_fact:
+    root_free_gb: >-
+      {{
+        (
+          ansible_mounts
+          | selectattr('mount', 'equalto', '/')
+          | map(attribute='size_available')
+          | first
+          / 1024 / 1024 / 1024
+        ) | round(0, 'floor') | int
+      }}
 
-- name: get free disk space in GB
-  ansible.builtin.shell:
-    cmd: df -h --block-size=G / | sed 1d | awk '{print $4}' | head -c -2
-  register: diskSpace
-
-- name: set newSwapSize based on diskSpace and RAM
-  set_fact:
-    #if there is lots of disk space (i.e. more than 4*RAM worth) then set /swapfile size to 2*RAM.  Else If there is limited space
-    #(i.e more than 2*RAM), set swapfile = RAM, Finally, if there is less space than that, set swapfile = 8GB or 4GB or 2GB depending on how little disk space there is
+# For systems with RAM ≥ 32GB, set swap to ~25% of RAM;
+# otherwise progressively reduce swap to 8G/4G/2G based on available space.
+- name: Decide desired /swapfile size in GB
+  ansible.builtin.set_fact:
     newSwapSize: >-
-      {%- if (diskSpace.stdout | int) > (ram | int * 4) -%}
-        {{ ram | int * 2 }}
-      {%- elif (diskSpace.stdout | int) > (ram | int * 2) -%}
-        {{ ram | int }}
-      {%- elif (diskSpace.stdout | int) >= 8 -%}
+      {%- set ram = ram_gb | int -%}
+      {%- set free = root_free_gb | int -%}
+      {%- if ram >= 32 -%}
+        {%- set target = ((ram / 4) | round(0, 'ceil') | int) -%}
+        {%- if free >= target + 2 -%}
+          {{ target }}
+        {%- elif free >= 8 -%}
+          8
+        {%- elif free >= 4 -%}
+          4
+        {%- else -%}
+          2
+        {%- endif -%}
+      {%- elif free > ram * 4 -%}
+        {{ ram * 2 }}
+      {%- elif free > ram * 2 -%}
+        {{ ram }}
+      {%- elif free >= 8 -%}
         8
-      {%- elif (diskSpace.stdout | int) >= 4 -%}
+      {%- elif free >= 4 -%}
         4
       {%- else -%}
         2
       {%- endif -%}
 
-# resize /swapfile when newSwapSize is greater than the current swapSize
-- block:
-    - name: turn off swap
+- name: Get active swap files/devices
+  ansible.builtin.command:
+    cmd: swapon --noheadings --raw --output NAME
+  register: active_swaps
+  changed_when: false
+  failed_when: false
+
+- name: Check /swapfile
+  ansible.builtin.stat:
+    path: /swapfile
+  register: swapfile_stat
+
+- name: Set current /swapfile size in GB
+  ansible.builtin.set_fact:
+    current_swapfile_gb: "{{ (swapfile_stat.stat.size | default(0) / 1024 / 1024 / 1024) | round(0, 'floor') | int }}"
+
+- name: Decide whether /swapfile needs resize/rebuild
+  ansible.builtin.set_fact:
+    swapfile_needs_rebuild: "{{ (current_swapfile_gb | int) != (newSwapSize | int) }}"
+
+- name: Remove legacy /swap.img entry from fstab
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: '^\s*/swap\.img\s+'
+    state: absent
+
+- name: Turn off legacy /swap.img if present
+  ansible.builtin.command:
+    cmd: swapoff /swap.img
+  changed_when: true
+  failed_when: false
+
+- name: Remove legacy /swap.img file
+  ansible.builtin.file:
+    path: /swap.img
+    state: absent
+
+- name: Remove duplicate /swapfile entries from fstab
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: '^\s*/swapfile\s+'
+    state: absent
+
+- name: Rebuild /swapfile only when size is wrong
+  when: swapfile_needs_rebuild | bool
+  block:
+    - name: Turn off /swapfile if active
       ansible.builtin.command:
         cmd: swapoff /swapfile
-      ignore_errors: true
+      when: "'/swapfile' in (active_swaps.stdout_lines | default([]))"
+      changed_when: true
+      failed_when: false
 
-    # use fallocate because it's significantly faster than dd
-    - name: create a new swap file
-      ansible.builtin.shell:
-        cmd: "fallocate -l {{ newSwapSize }}G /swapfile"
-
-    - name: set swap file permissions
+    - name: Remove old /swapfile before recreating
       ansible.builtin.file:
-        path: "/swapfile"
-        owner: "root"
-        group: "root"
-        mode: "u=rw,g=,o="
+        path: /swapfile
+        state: absent
 
-    - name: format the file for swap
+    - name: Create /swapfile at desired size
+      ansible.builtin.command:
+        cmd: "fallocate -l {{ newSwapSize | int }}G /swapfile"
+      changed_when: true
+
+    - name: Set /swapfile permissions
+      ansible.builtin.file:
+        path: /swapfile
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Format /swapfile
       ansible.builtin.command:
         cmd: mkswap /swapfile
+      changed_when: true
 
-    - name: turn on swap
-      ansible.builtin.command:
-        cmd: swapon /swapfile
+- name: Ensure /swapfile permissions are correct
+  ansible.builtin.file:
+    path: /swapfile
+    owner: root
+    group: root
+    mode: "0600"
 
-  when: (newSwapSize | int) > (swapSize.stdout | int)
+- name: Ensure /swapfile is in fstab once
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    line: "/swapfile none swap sw 0 0"
+    state: present
+
+- name: Refresh active swap list
+  ansible.builtin.command:
+    cmd: swapon --noheadings --raw --output NAME
+  register: active_swaps_after
+  changed_when: false
+  failed_when: false
+
+- name: Turn on /swapfile if not active
+  ansible.builtin.command:
+    cmd: swapon /swapfile
+  when: "'/swapfile' not in (active_swaps_after.stdout_lines | default([]))"
+  changed_when: true
